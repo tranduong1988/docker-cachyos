@@ -1,0 +1,107 @@
+name: Mirror CachyOS Image to GHCR
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force re-pull and push even if digests match'
+        required: false
+        type: boolean
+        default: false
+  # schedule:
+  #   - cron: '0 3 * * 1'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  SOURCE_IMAGE: cachyos/cachyos-v3
+  TARGET_IMAGE: ghcr.io/${{ github.repository_owner }}/cachyos-v3:latest
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get digests
+        id: digests
+        run: |
+          set -euo pipefail
+
+          # Lấy digest của image trên Docker Hub
+          echo "🔍 Checking Docker Hub digest..."
+          SOURCE_DIGEST=$(docker buildx imagetools inspect "${{ env.SOURCE_IMAGE }}" --format '{{json .Manifest}}' | jq -r '.digest // empty')
+          
+          if [[ -z "$SOURCE_DIGEST" ]]; then
+            # fallback nếu buildx không lấy được
+            docker pull "${{ env.SOURCE_IMAGE }}" >/dev/null
+            SOURCE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${{ env.SOURCE_IMAGE }}" | cut -d@ -f2)
+          fi
+          echo "source_digest=$SOURCE_DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Docker Hub digest: $SOURCE_DIGEST"
+
+          # Lấy digest của image trên GHCR (nếu có)
+          echo "🔍 Checking GHCR digest..."
+          if TARGET_DIGEST=$(docker buildx imagetools inspect "${{ env.TARGET_IMAGE }}" --format '{{json .Manifest}}' 2>/dev/null | jq -r '.digest // empty'); then
+            echo "target_digest=$TARGET_DIGEST" >> "$GITHUB_OUTPUT"
+            echo "GHCR digest:     $TARGET_DIGEST"
+          else
+            echo "target_digest=" >> "$GITHUB_OUTPUT"
+            echo "GHCR image does not exist yet"
+          fi
+
+      - name: Decide whether to update
+        id: decide
+        run: |
+          SOURCE="${{ steps.digests.outputs.source_digest }}"
+          TARGET="${{ steps.digests.outputs.target_digest }}"
+          FORCE="${{ inputs.force }}"
+
+          if [[ "$FORCE" == "true" ]]; then
+            echo "need_update=true" >> "$GITHUB_OUTPUT"
+            echo "🔄 Force enabled → will update"
+          elif [[ -z "$TARGET" ]]; then
+            echo "need_update=true" >> "$GITHUB_OUTPUT"
+            echo "🆕 Target image missing → will push"
+          elif [[ "$SOURCE" != "$TARGET" ]]; then
+            echo "need_update=true" >> "$GITHUB_OUTPUT"
+            echo "🔄 Digests differ → will update"
+            echo "   Source: $SOURCE"
+            echo "   Target: $TARGET"
+          else
+            echo "need_update=false" >> "$GITHUB_OUTPUT"
+            echo "✅ Digests match → skip"
+          fi
+
+      - name: Pull + Push to GHCR
+        if: steps.decide.outputs.need_update == 'true'
+        run: |
+          set -euo pipefail
+
+          echo "⬇️  Pulling ${{ env.SOURCE_IMAGE }}..."
+          docker pull "${{ env.SOURCE_IMAGE }}"
+
+          echo "🏷️  Tagging as ${{ env.TARGET_IMAGE }}"
+          docker tag "${{ env.SOURCE_IMAGE }}" "${{ env.TARGET_IMAGE }}"
+
+          echo "⬆️  Pushing to GHCR..."
+          docker push "${{ env.TARGET_IMAGE }}"
+
+          echo "✅ Done. New digest: ${{ steps.digests.outputs.source_digest }}"
+
+      - name: Summary
+        run: |
+          if [[ "${{ steps.decide.outputs.need_update }}" == "true" ]]; then
+            echo "### ✅ Image updated" >> $GITHUB_STEP_SUMMARY
+            echo "- Source digest: \`${{ steps.digests.outputs.source_digest }}\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ⏭️ Skipped (digests match)" >> $GITHUB_STEP_SUMMARY
+            echo "- Digest: \`${{ steps.digests.outputs.source_digest }}\`" >> $GITHUB_STEP_SUMMARY
+          fi
